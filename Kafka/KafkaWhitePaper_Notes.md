@@ -3,6 +3,12 @@
 > Paper: *Kafka: a Distributed Messaging System for Log Processing* — Jay Kreps, Neha Narkhede, Jun Rao (LinkedIn, NetDB'11).
 > This is a learner-friendly walkthrough of the original Kafka white paper. It mirrors the short-bullet style of `KafkaArchitectureWhitePaper.docx` and fills in the parts that doc doesn't cover.
 
+> **How to read this doc:**
+> - The body explains Kafka **as the 2011 paper described it**.
+> - Anything that has changed in modern Kafka (≈ Kafka 4.x, 2025) is flagged with a callout like this:
+>   > **[Modern Kafka — 2025]** what's different today.
+> - A summary of all changes lives in **Section 11 — What's new since 2011**.
+
 ---
 
 ## 1. Why Kafka was built
@@ -102,7 +108,10 @@ for (message : streams[0]) {
 - Offsets are **increasing but not consecutive**: next_offset = current_offset + message_length.
 - "Message ID" and "offset" are used interchangeably.
 
-TODO: When i see messgaes in Kafka controll center it shows consecutive offsetm but above para says it will not be consicutive ?
+> **[Modern Kafka — 2025] — answer to your TODO about Control Center showing consecutive offsets**
+> The 2011 paper used **byte offsets** (position in the log file) → so they jumped by message size, like 0 → 215 → 1451.
+> Kafka changed this very early (around 0.8). Today, offsets are **simple per-message counters**: 0, 1, 2, 3, ...
+> That's exactly what you see in Control Center. The byte-offset story above is the *original* design; the **logical offset (sequential int)** is the current one. Everything else (consumer reads from an offset, broker uses an in-memory index) still works the same way — only the numbering scheme changed.
 
 ### How a consumer reads
 - Consumer always reads a partition **sequentially**.
@@ -150,6 +159,11 @@ Linux `sendfile` collapses steps 2–3 → saves **2 copies + 1 syscall**. Kafka
   - **Time-based retention SLA** — delete after N days (typical: 7 days).
   - Works because most consumers (online or offline) finish in real-time, hourly, or daily.
   - And because perf doesn't degrade with bigger data sizes, long retention is cheap.
+
+> **[Modern Kafka — 2025]**
+> - Consumers still **own** their offset, but they **commit it to Kafka itself** — into an internal topic called **`__consumer_offsets`** (since Kafka 0.9). No more ZooKeeper for offsets.
+> - Retention is now configurable as **time** (`retention.ms`), **size** (`retention.bytes`), or **log compaction** (keep only the latest value per key — useful for "current state" topics).
+> - **Tiered storage** (Kafka 3.6+, KIP-405) can push old segments to **object storage (S3 etc.)** → effectively infinite retention at low cost.
 
 ### Side benefit: consumers can rewind
 - Breaks the classic queue contract, but it's a feature, not a bug.
@@ -210,6 +224,12 @@ Kafka won't hand C any partition because both are already owned. Lesson: **alway
   - **Ephemeral paths** — auto-deleted when the creator disconnects.
   - **Replicated data** — highly reliable.
 
+> **[Modern Kafka — 2025] — ZooKeeper is gone**
+> - Modern Kafka uses **KRaft** (Kafka Raft) instead of ZooKeeper. KRaft was GA in **Kafka 3.3 (2022)**, default in **3.5**, and ZooKeeper was **removed entirely in Kafka 4.0 (2025)**.
+> - With KRaft, a small subset of brokers act as **controllers** (running Raft consensus) — no external service needed.
+> - For consumer coordination, even before KRaft, Kafka 0.9 moved that responsibility into the brokers themselves (see the **GroupCoordinator** note in the rebalance section below).
+> - The decentralized "consumers compute the assignment themselves" model below is **historical** — today the broker-side coordinator does it.
+
 ### What Kafka stores in Zookeeper
 | Registry | What's in it | Lifetime |
 |---|---|---|
@@ -226,9 +246,30 @@ Kafka won't hand C any partition because both are already owned. Lesson: **alway
 2. Triggering **rebalance** in each consumer when (1) happens.
 3. Tracking which consumer owns which partition + the last consumed offset.
 
+> **[Modern Kafka — 2025]**
+> Only (1) — *broker* discovery — used to belong to ZooKeeper, and that's now handled by **KRaft controllers**.
+> Consumer-side work (2 and 3) moved out of ZooKeeper years ago:
+> - Group membership + assignment → handled by the **GroupCoordinator** broker (since 0.9).
+> - Offsets → stored in the **`__consumer_offsets`** topic (since 0.9).
+> So the "registries in ZooKeeper" table above is purely historical for modern clusters.
+
 ### Rebalance algorithm (Algorithm 1)
 
-TODO: Add simple Explaination for below 
+**Simple explanation (answer to your TODO):**
+The trick is that **no one is in charge** — every consumer figures out its share by following the same recipe. Five steps:
+
+1. **Drop everything.** The consumer releases all partitions it currently owns (so nothing is double-owned during the handover).
+2. **Look around.** It reads two lists from ZooKeeper: *who's alive in my group* and *what partitions exist for the topics I follow.*
+3. **Sort both lists.** Everyone sorts them the same way, so every consumer in the group ends up with an **identical view**.
+4. **Find your slot.** "I'm consumer #2 of 4, so I take partitions #2 of 4." Just divide partitions evenly and pick your slice by index.
+5. **Claim and start reading.** For each picked partition, write "I own this" in ZooKeeper, look up the last committed offset, and start pulling from there.
+
+Because all consumers see the same input and follow the same recipe, they all arrive at the **same assignment** without talking to each other. No master, no negotiation.
+
+> **[Modern Kafka — 2025]**
+> The "everyone computes it themselves from ZooKeeper" model was replaced in **Kafka 0.9** by a **GroupCoordinator** — one broker is elected as coordinator for each consumer group, consumers send it heartbeats, and **it** decides the assignment and ships it to everyone.
+> Modern strategies are pluggable: **Range**, **RoundRobin**, **Sticky** (try to keep each consumer's old partitions on rebalance), and **CooperativeSticky** (rebalance *incrementally* — no more "stop the world, drop everything" pause).
+
 When a consumer `Ci` in group `G` rebalances:
 ```
 For each topic T that Ci subscribes to {
@@ -277,6 +318,15 @@ For each topic T that Ci subscribes to {
   - If a broker dies, its unconsumed messages are **temporarily unavailable**.
   - If its disk is destroyed, those messages are **lost forever**.
   - Replication is listed as **future work** (and was added in later Kafka versions).
+
+> **[Modern Kafka — 2025] — most of the 2011 limitations are fixed**
+> - **Exactly-once is real.** Kafka 0.11 (2017) added the **idempotent producer** (`enable.idempotence=true`) so retries can't create duplicates, plus a **transactional API** for atomic "read → process → write" across multiple partitions.
+> - **Replication is built-in** (since 0.8). Every partition has a **leader** + **followers**, and the set of up-to-date copies is the **ISR (in-sync replicas)**.
+>   - Producer durability is tunable via **`acks`**: `0` (fire-and-forget), `1` (leader wrote it), `all` (every ISR wrote it).
+>   - `min.insync.replicas` sets a floor — e.g. require at least 2 copies before accepting writes.
+>   - On broker death, a follower in the ISR is promoted to leader → no data loss if `acks=all`.
+> - **Order:** unchanged — still in-order within a partition, no guarantee across partitions. (Idempotence preserves order on retries too.)
+> - **CRC + recovery:** still the same idea — modern Kafka uses CRC32C per **record batch**.
 
 ---
 
@@ -386,3 +436,51 @@ Compared against **ActiveMQ 5.4** (JMS) and **RabbitMQ 2.4**.
 - **OS page cache + `sendfile` + batching + append-only logs** = throughput.
 - **Time-based retention (~7 days)** lets brokers stay stateless and lets consumers rewind.
 - **At-least-once** delivery, **in-order within a partition**, CRC per message.
+
+> **[Modern Kafka — 2025] — the same model with the 2025 swaps**
+> - Offsets are **sequential per-message ints (0, 1, 2…)**, not byte positions.
+> - **No ZooKeeper** — cluster metadata lives in **KRaft controllers**; consumer offsets + group state live **in Kafka itself** (`__consumer_offsets`, GroupCoordinator).
+> - Partitions are **replicated** (leader + followers + ISR); producer picks durability with `acks`.
+> - Retention can be time / size / **compaction**, and old segments can spill to **tiered (S3) storage**.
+> - **Exactly-once** is available end-to-end (idempotent producer + transactions).
+> - Everything else (pull model, page-cache reliance, sendfile, in-order per partition, one owner per partition per group) is unchanged.
+
+---
+
+## 11. What's new since 2011 — cheatsheet
+
+A compact list of everything that has changed since the white paper, in order. If you're coming from the 2011 paper, this is the diff.
+
+| Version (year) | What landed | Why it matters |
+|---|---|---|
+| **0.8 (2013)** | **Replication** (leader/follower, ISR), new offset = sequential int | No data loss on broker failure; paper's biggest "future work" item done |
+| **0.8.1 (2014)** | **Log compaction** | Keep only the latest value per key → use a topic as a "current state" store |
+| **0.9 (2015)** | **`__consumer_offsets` topic**, **GroupCoordinator**, **Kafka Connect**, security (SASL/SSL/ACLs) | Offsets + group mgmt out of ZooKeeper; multi-tenant clusters became safe |
+| **0.10 (2016)** | **Kafka Streams**, message **timestamps**, rack awareness | DSL for stream processing without an external framework |
+| **0.11 (2017)** | **Idempotent producer**, **transactions** → **exactly-once semantics**, message **headers**, new compact record-batch format | The single biggest leap in correctness |
+| **1.x – 2.x (2017–2019)** | JBOD improvements, better admin API, **incremental fetch**, perf tuning | Operational maturity |
+| **2.4 (2019)** | **Cooperative / Incremental rebalancing** | Rebalances no longer "stop the world" — consumers keep their unaffected partitions |
+| **2.8 (2021)** | **KRaft preview** (Kafka without ZooKeeper) | First glimpse of ZK-free Kafka |
+| **3.3 (2022)** | **KRaft GA** for new clusters | ZooKeeper officially optional |
+| **3.5 (2023)** | KRaft is the default for new clusters | Most new deployments are ZK-free |
+| **3.6 (2023)** | **Tiered storage (KIP-405)** | Old segments offload to S3-class storage → cheap "forever" retention |
+| **3.7 (2024)** | **KIP-848** ("next-gen consumer protocol") preview | Rebalance logic moved fully to the broker, faster + simpler client |
+| **4.0 (2025)** | **ZooKeeper removed entirely**, KIP-848 default, JDK 17+ baseline | Modern Kafka = KRaft-only |
+
+### Things from the paper that are now wrong (quick list)
+- "Offsets are byte offsets, not consecutive." → Now sequential ints.
+- "Broker doesn't track consumer offsets." → Still consumer-driven, but **stored in Kafka** (`__consumer_offsets`), not on the client.
+- "ZooKeeper holds broker / consumer / ownership / offset registries." → All four are gone from ZooKeeper. Broker metadata → KRaft. Consumer side → GroupCoordinator + `__consumer_offsets`.
+- "Consumers compute the rebalance themselves." → Broker-side GroupCoordinator decides; clients just receive the assignment.
+- "Kafka only guarantees at-least-once." → Exactly-once is supported.
+- "If a broker's disk dies, messages are lost." → Replication + ISR + `acks=all` prevent this.
+- "Producer doesn't wait for acks." → `acks` is configurable (0 / 1 / all); `all` is the modern default for durable pipelines.
+- "Retention is time-based, ~7 days." → Time **or** size **or** compaction, and tiered storage extends it indefinitely.
+- "Avro + a lightweight schema registry." → **Confluent Schema Registry** is the de-facto choice and supports **Avro, JSON Schema, and Protobuf**.
+
+### New ecosystem pieces the paper couldn't mention
+- **Kafka Connect** — declarative source/sink connectors (DBs, S3, Elasticsearch…). No more bespoke MapReduce loaders.
+- **Kafka Streams** — JVM library for stateful stream processing on top of Kafka (windows, joins, state stores).
+- **ksqlDB** — SQL over Kafka Streams.
+- **MirrorMaker 2** — cross-cluster replication built on Kafka Connect (the modern replacement for the LinkedIn "embedded consumer" pattern in Section 7).
+- **Cruise Control** — automated partition rebalancing across brokers.
