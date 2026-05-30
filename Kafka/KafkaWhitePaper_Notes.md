@@ -102,6 +102,8 @@ for (message : streams[0]) {
 - Offsets are **increasing but not consecutive**: next_offset = current_offset + message_length.
 - "Message ID" and "offset" are used interchangeably.
 
+TODO: When i see messgaes in Kafka controll center it shows consecutive offsetm but above para says it will not be consicutive ?
+
 ### How a consumer reads
 - Consumer always reads a partition **sequentially**.
 - Acking offset N means "I've got everything up to N in this partition."
