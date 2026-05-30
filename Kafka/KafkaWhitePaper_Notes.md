@@ -228,6 +228,7 @@ Kafka won't hand C any partition because both are already owned. Lesson: **alway
 
 ### Rebalance algorithm (Algorithm 1)
 
+TODO: Add simple Explaination for below 
 When a consumer `Ci` in group `G` rebalances:
 ```
 For each topic T that Ci subscribes to {
